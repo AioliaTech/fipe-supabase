@@ -1,0 +1,32 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Instala cron e dependências
+RUN apt-get update && apt-get install -y \
+    cron \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copia e instala dependências Python
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copia o código
+COPY . .
+
+# Torna scripts executáveis
+RUN chmod +x run_sync.sh
+
+# Configura cron job (terça-feira à meia-noite)
+RUN echo "0 0 * * 2 cd /app && /app/run_sync.sh" > /etc/cron.d/fipe-cron && \
+    chmod 0644 /etc/cron.d/fipe-cron && \
+    crontab /etc/cron.d/fipe-cron
+
+# Cria arquivo de log
+RUN touch /var/log/fipe-sync.log && chmod 666 /var/log/fipe-sync.log
+
+ENV PYTHONUNBUFFERED=1
+
+# Inicia cron em foreground
+CMD ["cron", "-f"]
