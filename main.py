@@ -1,112 +1,178 @@
-from fipe_service import FipeService
-from database import SupabaseDB
-import time
-import sys
 import argparse
+import logging
+from database import SupabaseDB
+from fipe_service import FipeAPI
 
-def sync_fipe_to_supabase(tipo_veiculo_especifico=None, limite_marcas=None):
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Marcas específicas para sincronizar
+MARCAS_CARROS = [
+    'Fiat', 'Volkswagen', 'Chevrolet', 'Toyota', 'Hyundai', 'Renault', 
+    'Jeep', 'Honda', 'BYD', 'Nissan', 'CAOA Chery', 'Ford', 'Citroën', 
+    'GWM', 'RAM', 'Mitsubishi', 'Peugeot', 'BMW', 'Mercedes-Benz', 
+    'Volvo', 'Land Rover', 'Audi', 'Kia', 'Subaru', 'Mazda', 
+    'Jaguar', 'Porsche'
+]
+
+MARCAS_MOTOS = [
+    'Honda', 'Yamaha', 'Shineray', 'Mottu', 'Avelloz', 'Royal Enfield',
+    'Haojue', 'Dafra', 'BMW Motorrad', 'Kawasaki', 'Ducati', 
+    'Triumph', 'Suzuki'
+]
+
+def normalizar_nome_marca(nome: str) -> str:
+    """Normaliza nome da marca para comparação"""
+    # Remove acentos e converte para minúsculas
+    nome = nome.lower().strip()
+    
+    # Mapeamentos especiais
+    mapeamentos = {
+        'caoa chery': 'chery',
+        'great wall': 'gwm',
+        'great wall motors': 'gwm',
+    }
+    
+    return mapeamentos.get(nome, nome)
+
+def marca_esta_na_lista(marca_api: str, lista_marcas: list) -> bool:
+    """Verifica se a marca da API está na lista desejada"""
+    marca_normalizada = normalizar_nome_marca(marca_api)
+    
+    for marca_desejada in lista_marcas:
+        if normalizar_nome_marca(marca_desejada) in marca_normalizada:
+            return True
+        if marca_normalizada in normalizar_nome_marca(marca_desejada):
+            return True
+    
+    return False
+
+def sync_fipe_to_supabase(tipo_veiculo: str, limite_marcas: int = None, marcas_filtradas: list = None):
     """
-    Sincroniza dados da FIPE para o Supabase
+    Sincroniza dados da FIPE com o Supabase
     
     Args:
-        tipo_veiculo_especifico: 'carros', 'motos', ou 'caminhoes' (None para todos)
-        limite_marcas: Limitar número de marcas processadas (útil para testes)
+        tipo_veiculo: 'carros', 'motos' ou 'caminhoes'
+        limite_marcas: Quantidade máxima de marcas (para teste)
+        marcas_filtradas: Lista de marcas específicas para buscar
     """
-    
-    fipe = FipeService()
     db = SupabaseDB()
+    api = FipeAPI()
     
-    print("🚀 Iniciando sincronização FIPE -> Supabase\n")
+    logger.info(f"\n{'='*60}")
+    logger.info(f"🚀 Iniciando sincronização de {tipo_veiculo.upper()}")
+    logger.info(f"{'='*60}\n")
     
-    tipos = [tipo_veiculo_especifico] if tipo_veiculo_especifico else fipe.tipos_veiculo
+    # Buscar todas as marcas da API
+    todas_marcas = api.obter_marcas(tipo_veiculo)
     
-    for tipo_veiculo in tipos:
-        print(f"\n{'='*60}")
-        print(f"📋 Processando: {tipo_veiculo.upper()}")
-        print(f"{'='*60}\n")
+    # Filtrar apenas as marcas desejadas
+    if marcas_filtradas:
+        marcas = [m for m in todas_marcas if marca_esta_na_lista(m['nome'], marcas_filtradas)]
+        logger.info(f"🎯 Filtrando {len(marcas)} de {len(todas_marcas)} marcas")
+    else:
+        marcas = todas_marcas
+    
+    if limite_marcas:
+        marcas = marcas[:limite_marcas]
+        logger.info(f"⚠️  MODO TESTE: Processando apenas {limite_marcas} marcas")
+    
+    total_marcas = len(marcas)
+    
+    for idx, marca in enumerate(marcas, 1):
+        logger.info(f"\n[{idx}/{total_marcas}] Processando marca: {marca['nome']}")
         
-        # 1. Buscar e inserir marcas
-        marcas = fipe.get_marcas(tipo_veiculo)
+        # Inserir marca
+        marca_id = db.inserir_marca(
+            codigo=marca['codigo'],
+            nome=marca['nome'],
+            tipo_veiculo=tipo_veiculo
+        )
         
-        # Limitar marcas se especificado (útil para testes)
-        if limite_marcas:
-            marcas = marcas[:limite_marcas]
+        if not marca_id:
+            logger.warning(f"❌ Falha ao inserir marca {marca['nome']}")
+            continue
         
-        print(f"✓ Encontradas {len(marcas)} marcas de {tipo_veiculo}")
+        # Buscar modelos
+        modelos = api.obter_modelos(tipo_veiculo, marca['codigo'])
         
-        for idx, marca in enumerate(marcas, 1):
-            print(f"\n[{idx}/{len(marcas)}] Processando marca: {marca['nome']}")
+        if not modelos:
+            logger.warning(f"  ⚠️  Nenhum modelo encontrado")
+            continue
+        
+        for modelo in modelos:
+            # Inserir modelo
+            modelo_id = db.inserir_modelo(
+                codigo=modelo['codigo'],
+                nome=modelo['nome'],
+                marca_id=marca_id,
+                tipo_veiculo=tipo_veiculo
+            )
             
-            try:
-                # Inserir marca
-                marca_inserida = db.insert_marca(marca)
-                if not marca_inserida:
-                    marca_inserida = db.get_marca_by_codigo(marca['codigo'], tipo_veiculo)
-                
-                if not marca_inserida:
-                    print(f"  ⚠️  Erro ao processar marca {marca['nome']}")
-                    continue
-                
-                marca_id = marca_inserida['id']
-                
-                # 2. Buscar e inserir modelos
-                modelos = fipe.get_modelos(tipo_veiculo, marca['codigo'])
-                print(f"  ✓ {len(modelos)} modelos encontrados")
-                
-                for modelo in modelos:
-                    modelo_inserido = db.insert_modelo(modelo, marca_id)
-                    if not modelo_inserido:
-                        modelo_inserido = db.get_modelo_by_codigo(
-                            modelo['codigo'], marca_id, tipo_veiculo
-                        )
-                    
-                    if not modelo_inserido:
-                        continue
-                    
-                    modelo_id = modelo_inserido['id']
-                    
-                    # 3. Buscar e inserir versões (anos)
-                    anos = fipe.get_anos(tipo_veiculo, marca['codigo'], modelo['codigo'])
-                    
-                    for ano in anos:
-                        versao = fipe.get_versao(
-                            tipo_veiculo, marca['codigo'], modelo['codigo'], ano
-                        )
-                        if versao:
-                            db.insert_versao(versao, modelo_id)
-                    
-                    # Delay para não sobrecarregar a API
-                    time.sleep(0.3)
-                
-                print(f"  ✅ Marca {marca['nome']} concluída!")
-                
-            except Exception as e:
-                print(f"  ❌ Erro ao processar marca {marca['nome']}: {e}")
+            if not modelo_id:
                 continue
+            
+            # Buscar anos/versões
+            anos = api.obter_anos(tipo_veiculo, marca['codigo'], str(modelo['codigo']))
+            
+            for ano in anos:
+                # Buscar valor detalhado
+                detalhes = api.obter_valor(
+                    tipo_veiculo,
+                    marca['codigo'],
+                    str(modelo['codigo']),
+                    ano['codigo']
+                )
+                
+                if detalhes:
+                    db.inserir_versao(
+                        codigo=ano['codigo'],
+                        nome=ano['nome'],
+                        modelo_id=modelo_id,
+                        tipo_veiculo=tipo_veiculo,
+                        ano_modelo=detalhes.get('AnoModelo'),
+                        combustivel=detalhes.get('Combustivel'),
+                        codigo_fipe=detalhes.get('CodigoFipe'),
+                        mes_referencia=detalhes.get('MesReferencia'),
+                        valor=detalhes.get('Valor')
+                    )
+        
+        logger.info(f"✅ Marca {marca['nome']} concluída!")
     
-    print("\n" + "="*60)
-    print("🎉 Sincronização concluída!")
-    print("="*60)
+    logger.info(f"\n{'='*60}")
+    logger.info(f"✅ Sincronização de {tipo_veiculo.upper()} finalizada!")
+    logger.info(f"{'='*60}\n")
 
 def main():
-    parser = argparse.ArgumentParser(description='Sincroniza dados da FIPE para Supabase')
-    parser.add_argument('--tipo', choices=['carros', 'motos', 'caminhoes'], 
-                        help='Tipo de veículo específico')
-    parser.add_argument('--limite', type=int, 
-                        help='Limitar número de marcas (útil para testes)')
-    parser.add_argument('--test', action='store_true',
-                        help='Modo teste: processa apenas 2 marcas de carros')
+    parser = argparse.ArgumentParser(description='Sincronizar dados FIPE com Supabase')
+    parser.add_argument('--test', action='store_true', help='Modo teste (apenas 2 marcas)')
+    parser.add_argument('--tipo', choices=['carros', 'motos', 'caminhoes', 'todos'], 
+                       default='todos', help='Tipo de veículo')
     
     args = parser.parse_args()
     
-    if args.test:
-        print("🧪 Modo TESTE ativado - processando apenas 2 marcas de carros\n")
-        sync_fipe_to_supabase(tipo_veiculo_especifico='carros', limite_marcas=2)
-    else:
-        sync_fipe_to_supabase(
-            tipo_veiculo_especifico=args.tipo,
-            limite_marcas=args.limite
-        )
+    limite = 2 if args.test else None
+    
+    try:
+        if args.tipo in ['carros', 'todos']:
+            sync_fipe_to_supabase('carros', limite, MARCAS_CARROS)
+        
+        if args.tipo in ['motos', 'todos']:
+            sync_fipe_to_supabase('motos', limite, MARCAS_MOTOS)
+        
+        # Caminhões desabilitado (não tem lista específica)
+        # if args.tipo == 'caminhoes':
+        #     sync_fipe_to_supabase('caminhoes', limite)
+        
+        logger.info("\n🎉 Processo completo!")
+        
+    except KeyboardInterrupt:
+        logger.info("\n⚠️  Processo interrompido pelo usuário")
+    except Exception as e:
+        logger.error(f"\n❌ Erro fatal: {str(e)}", exc_info=True)
 
 if __name__ == "__main__":
     main()
